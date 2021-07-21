@@ -1,0 +1,454 @@
+---
+title: "Final"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+##Download the data form yahoo finance(Using adjusted close price)
+```{r}
+library(quantmod)
+library(quadprog)
+library(matrixcalc)
+library(Matrix)
+
+#Using one more day back to calculate the return at the begining of the period
+getSymbols("^GSPC",src = "yahoo",from="2007-02-28",to="2020-06-30")
+benchmark <- GSPC$GSPC.Adjusted
+
+
+Ticker <- c("FXE","EWJ","GLD","QQQ","SPY","SHV","DBA","USO","XBI","ILF","EPP","FEZ")
+price_port <- 0
+price <- getSymbols(Ticker[1],src = "yahoo",from="2007-02-28",to="2020-06-30",auto.assign = FALSE)
+price_port <- price[,6]
+for(i in 2:length(Ticker)){
+  price <- getSymbols(Ticker[i],src = "yahoo",from="2007-02-28",to="2020-06-30",auto.assign = FALSE)
+  price_port <- cbind(price[,6],price_port)
+}
+
+
+```
+
+
+##Three factor model. The data is in the file "factor.csv" 
+```{r}
+factor <- read.csv("factor.csv",header =TRUE)
+#It's percentage return
+factor[,1] <- factor[,1]/100
+```
+
+
+##Daily return
+```{r}
+return <- matrix(0,3358,12)
+for(i in 1:12){
+  price_onesecurity <- price_port[,i]
+  return[,i] <- dailyReturn(price_onesecurity,type = "log")
+}
+#We calculate one more day.
+return <- return[2:3358,]
+price_port <- price_port[2:3358,]
+return_benchmark <- dailyReturn(benchmark,type = "log")
+return_benchmark <- return_benchmark[2:3358]
+
+#Three sub-period
+port_before <- return[1:360,]
+port_during <- return[361:611,]
+port_after <- return[612:3357,]
+index_before <- return_benchmark[1:360]
+index_during <- return_benchmark[361:611]
+index_after <- return_benchmark[612:3357]
+factor_before <- factor[1:360,]
+factor_during <- factor[361:611,]
+factor_after <- factor[612:3357,]
+```
+
+
+##Function of linear regression
+```{r}
+coeff <- function(b1,b2,b3,y){
+  data <- data.frame(y=y,b1=b1,b2=b2,b3=b3)
+  solution <- lm(y~.,data = data)
+  return(solution$coefficients)
+}
+```
+
+##Function to calculate covariance matrix
+```{r}
+thevariance <- function(ri,rm,fac){
+  beta <- 0
+  sig_m <- var(rm)
+  b1 <- rm-fac[,4]/250
+  for(i in 1:12){
+    y <- ri[,i]-fac[,4]/250
+    coef <- coeff(b1,fac[,2],fac[,3],y)
+    beta[i] <- coef[2]
+}
+  cov <- matrix(0,12,12)
+  for(i in 1:12){
+    for(j in 1:i){
+      if(j==i){
+        cov[j,j] <- var(ri[,i])
+      }else{
+        cov[i,j] <- beta[i]*beta[j]*sig_m
+        cov[j,i] <- cov[i,j]
+      }
+    }
+  }
+  return(cov)
+}
+
+```
+
+##Function to calculate the beta_im
+```{r}
+thebeta <- function(ri,rm){
+  beta_im <- matrix(0,12,1)
+  for(i in 1:12){
+    beta_im[i,1] <- cov(ri[,i],rm)/var(rm)
+  }
+
+  return(beta_im)
+}
+```
+
+##Function of Optimization
+```{r}
+weight_opt <- function(wp,cov,ri,rm,fac,target,today,lum){
+ 
+  mean_smb <- mean(fac[,2])
+  mean_hml <- mean(fac[,3])
+  mean_market <- mean(rm)
+  mean_return <- matrix(0,12,1)
+  #Calculate the Expected return
+  for(i in 1:12){
+    y1 <- ri[,i]-fac[,4]/250
+    b2 <- rm-fac[,4]/250
+    co <- coeff(b2,fac[,2],fac[,3],y1)
+    mean_return[i,1] <- today[1,4]/250+co[2]*(mean_market-today[1,4]/250)+co[3]*mean_smb+co[4]*mean_hml+co[1]
+  }
+  
+
+
+
+  beta_use <- thebeta(ri,rm)
+  
+  d <- mean_return+lum*cov%*%wp
+
+
+  Dmat <- lum*cov
+  dvec <- d
+  A.E <- matrix(1,12,1)
+  Amat <- cbind(A.E,beta_use,diag(1,12),-diag(1,12))
+  bvec <- c(1,target,rep(-2,12),rep(-2,12))
+  #The optimizer
+  solve <- solve.QP(Dmat,dvec,Amat,bvec,meq=2)
+  return(solve$solution)
+}
+```
+
+
+
+##Analyze of one period 
+
+```{r}
+#This is function of all we need for one period.
+theopt <- function(period,return,return_benchmark,factor,lum){
+  
+  #Use a loop to calculate all the situation for one period
+  p_total <- 0
+  per <- matrix(0,9,12)
+  #want contains all the cases we want
+  want <- matrix(c(period,30,30,-1,period,30,80,-1,period,30,120,-1,period,80,30,-1,period,120,30,-1,period,80,80,-1,period,80,80,-0.5,period,80,80,0,period,80,80,0.5,period,80,80,1,period,80,80,1.5),11,4,byrow = TRUE)
+  want
+  
+  for(l in 1:11){
+  
+#Indicator tells us which period we need to analyze 
+indicator <- want[l,1]
+#Period length for covariance
+l1 <- want[l,2]
+#Period length for expected return
+l2 <- want[l,3]
+#The target beta
+target <- want[l,4]
+
+l_max <- max(l1,l2)
+
+start <- max(l1,l2)+1
+S0 <- 100
+wp <- matrix(1/12,12,1)
+
+#Which period we want
+if(indicator==1){      #Before
+  r_p <- return[1:360,]
+  r_m <- return_benchmark[1:360]
+  fac <- factor[1:360,]
+}else if(indicator==2){     #During
+  r_p <- return[(361-120):510,]           
+  r_m <- return_benchmark[(361-120):510]
+  fac <- factor[(361-120):510,]
+}else if(indicator==3){       #After                   
+  r_p <- return[(511-120):760,]
+  r_m <- return_benchmark[(511-120):760]
+  fac <- factor[(511-120):760,]
+}else{                       #The whole period
+  r_p <- return
+  r_m <- return_benchmark
+  fac <- factor
+}
+
+#Every security value
+S_p <- 100*wp
+
+n <- length(r_p[,1])
+S <- matrix(0,(n-120),1)
+start <- 121
+
+#The first 5 days price (equal weights)
+for(i in 1:12){
+  S[1,1] <-S[1,1]+S_p[i,1]*exp(r_p[start,i])
+}
+for(i in 1:12){
+  S[2,1] <-S[2,1]+S_p[i,1]*exp(r_p[start,i]+r_p[start+1,i])
+}
+for(i in 1:12){
+  S[3,1] <-S[3,1]+S_p[i,1]*exp(r_p[start,i]+r_p[start+1,i]+r_p[start+2,i])
+}
+for(i in 1:12){
+  S[4,1] <-S[4,1]+S_p[i,1]*exp(r_p[start,i]+r_p[start+1,i]+r_p[start+2,i]+r_p[start+3,i])
+}
+for(i in 1:12){
+  S[5,1] <-S[5,1]+S_p[i,1]*exp(r_p[start,i]+r_p[start+1,i]+r_p[start+2,i]+r_p[start+3,i]+r_p[start+4,i])
+}
+
+k <- start+5
+
+
+for(i in (start+5):3357){
+  if(k<(n-5)){
+    
+    #The look back period for covariance matrix
+    ri_c <- r_p[(k-l1):(k-1),]
+    rm_c <- r_m[(k-l1):(k-1)]
+    fac_c <- fac[(k-l1):(k-1),]
+    covariance <- thevariance(ri_c,rm_c,fac_c)
+    pd <- is.positive.definite(covariance)
+    
+    #Sometimes the covariance matrix is not Positive Definite 
+    if(pd==FALSE){
+      covariance <- as.matrix(nearPD(covariance,keepDiag = TRUE)$mat)
+    }
+    
+    
+    
+    #The look back period for finding new weights
+    ri_e <- r_p[(k-l2):(k-1),]
+    rm_e <- r_m[(k-l2):(k-1)]
+    fac_e <- fac[(k-l2):(k-1),]
+    
+    today <- fac[k,]
+    wp_new <- weight_opt(wp,covariance,ri_e,rm_e,fac_e,target,today,lum)
+    #The new weight
+    wp <- wp_new
+    wp <- matrix(wp,12,1)
+    #The new values on each security
+    S_p <- S[k-start,1]*wp
+    
+    #Calculate the price
+    for(j in 1:5){
+      for(i in 1:12){
+        S[k-start+j,1] <-S[k-start+j,1]+S_p[i,1]*exp(sum(r_p[k:(k+j-1),i]))
+      }
+    }
+    
+  }else if(k>(n-5)&&k<n){
+    for(j in 1:(n-k+1)){
+      for(i in 1:12){
+        S[k-start+j,1] <-S[k-start+j,1]+S_p[i,1]*exp(sum(r_p[k:(k+j-1),i]))
+      }
+    }
+    
+  }else{
+    break
+  }
+  
+  #Rebalance every week
+  k <- k+5
+  
+  
+  
+}
+
+
+
+
+#The price of Market
+S_M <- matrix(0,(n-120),1)
+for(i in 1:(n-120)){
+  S_M[i,1] <- 100*exp(sum(r_m[(120+1):(120+i)]))
+}
+
+
+
+
+## The perfomence
+
+#Transfer the data to time series
+S <- as.xts(S,index(r_m[121:n]))
+S_M <- as.xts(S_M,index(r_m[121:n]))
+
+#Cummulated P&L
+cum_p <- 0   #portfolio
+cum_m <- 0   #market
+
+for(i in 1:length(S)){
+  cum_p[i] <- (S[i]-100)/100
+  cum_m[i] <- (S_M[i]-100)/100
+}
+
+r_port <- 0
+r_market <- 0
+
+r_port <- dailyReturn(S,type = "log")
+r_market <- dailyReturn(S_M,type = "log")
+r_port[1] <- log(S[1]/100)
+r_market[1] <- log(S_M[1]/100)
+
+
+##Plot of portfolio value
+
+library(ggplot2)
+p1 <- data.frame(y=S,x=index(S_M))
+p2 <- data.frame(y=S_M,x=index(S_M))
+
+
+
+##Plot of cummulated P&L
+
+p1 <- data.frame(y=cum_p,x=index(r_port))
+p2 <- data.frame(y=cum_m,x=index(r_market))
+p <- ggplot()+geom_path(data=p1,aes(x=x,y=y),col=hcl(h=runif(1,0,359),c=50,l=30))+geom_path(data=p2,aes(x=x,y=y),col="blue")
+plot(p)
+if(l!=1){
+  p_total <-p_total+geom_path(data=p1,aes(x=x,y=y),col=hcl(h=runif(1,0,359),c=50,l=30))+geom_path(data=p2,aes(x=x,y=y),col="blue") 
+}else{
+  p_total <-ggplot()+ geom_path(data=p1,aes(x=x,y=y),col=hcl(h=runif(1,0,359),c=50,l=30))+geom_path(data=p2,aes(x=x,y=y),col="blue")
+}
+
+
+##Plot of Distribution of return.
+plot(density(r_port))
+
+##Max 10 days drawdown
+
+drawdown <- function(p4){
+  len <- length(p4)
+  drawdown_10days <- 0
+  for(i in 1:(len-10)){
+    drawdown_10days[i] <- (p4[i+10]-p4[i])/p4[i]
+  }
+  return(min(drawdown_10days))
+}
+
+##The statistics
+
+library(PerformanceAnalytics)
+library(e1071)
+port_mean <- mean(r_port)*250
+port_vol <- sqrt(var(r_port)*250)
+port_skew <- skewness(r_port)/sqrt(250)
+port_kurt <- kurtosis(r_port)/250
+port_sharp <- mean(r_port-fac[121:n,4]/250)/sqrt(var(r_port-fac[121:n,4]/250))
+port_MDD <- drawdown(as.numeric(S))
+port_VAR <- VaR(r_port,p=.95,method="modified")
+port_CVAR <- ES(r_port,p=.95,method="modified")
+
+performance <- matrix(0,9,1)
+performance[2,1] <- port_mean
+performance[3,1] <- port_vol
+performance[4,1] <- port_skew
+performance[5,1] <- port_kurt
+performance[6,1] <- port_sharp
+performance[7,1] <- port_MDD
+performance[8,1] <- port_VAR
+performance[9,1] <- port_CVAR
+performance[1,1] <- cum_p[length(cum_p)]
+per[,l] <- performance
+
+  }
+  #Just for convenience
+  r_port <-r_market 
+
+port_mean <- mean(r_port)*250
+port_vol <- sqrt(var(r_port)*250)
+port_skew <- skewness(r_port)/sqrt(250)
+port_kurt <- kurtosis(r_port)/250
+port_sharp <- mean(r_port-fac[121:n,4])/sqrt(var(r_port-fac[121:n,4]))
+port_MDD <- drawdown(as.numeric(S_M))
+port_VAR <- VaR(r_port,p=.95,method="modified")
+port_CVAR <- ES(r_port,p=.95,method="modified")
+
+performance <- matrix(0,9,1)
+performance[2,1] <- port_mean
+performance[3,1] <- port_vol
+performance[4,1] <- port_skew
+performance[5,1] <- port_kurt
+performance[6,1] <- port_sharp
+performance[7,1] <- port_MDD
+performance[8,1] <- port_VAR
+performance[9,1] <- port_CVAR
+performance[1,1] <- cum_m[length(cum_m)]
+
+
+per[,12] <- performance
+  
+  #Combine all P&L in one plot
+  plot(p_total)
+  
+#Return statistics
+return(per)
+  
+}
+```
+
+#Just use function
+```{r}
+#"1" is for before, "2" is for during,"3" is for after. "4" is for whole.
+lum <- 1
+#This function can plot all we need
+per <- theopt(1,return,return_benchmark,factor,lum)
+row.names(per) <- c("Cumulated P&L","Mean","Volatility","Skewness","Kurtosis","Sharpe ratio","MDD","VAR","CVAR")
+per
+write.csv(per,"Performance1.csv")
+
+
+```
+
+```{r}
+per <- theopt(2,return,return_benchmark,factor,lum)
+per
+write.csv(per,"Performance2.csv")
+```
+
+```{r}
+per <- theopt(3,return,return_benchmark,factor,lum)
+per
+write.csv(per,"Performance3.csv")
+
+```
+
+```{r}
+per <- theopt(4,return,return_benchmark,factor,lum)
+per
+write.csv(per,"Performance4.csv")
+```
+
+
+
+
+
+
